@@ -11,6 +11,7 @@ import time
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib, GObject
 from hailo_apps_infra.gstreamer_helper_pipelines import get_source_type
+import hailo_apps_infra.hailo_rpi_common as hailo_rpi_common
 
 try:
     from picamera2 import Picamera2
@@ -28,8 +29,8 @@ except ImportError:
 class app_callback_class:
     def __init__(self):
         self.frame_count = 0
-        self.use_frame = False
-        self.frame_queue = multiprocessing.Queue(maxsize=3)
+        self.use_frame = True
+        self.frame_queue = multiprocessing.Queue(maxsize=1)
         self.running = True
 
     def increment(self):
@@ -66,12 +67,9 @@ def dummy_callback(pad, info, user_data):
 # GStreamerApp class
 # -----------------------------------------------------------------------------------------------
 class GStreamerApp:
-    def __init__(self, args, user_data: app_callback_class):
+    def __init__(self,user_data: app_callback_class):
         # Set the process title
         setproctitle.setproctitle("Hailo Python App")
-
-        # Create options menu
-        self.options_menu = args
 
         # Set up signal handler for SIGINT (Ctrl-C)
         signal.signal(signal.SIGINT, self.shutdown)
@@ -83,10 +81,10 @@ class GStreamerApp:
             exit(1)
         self.current_path = os.path.dirname(os.path.abspath(__file__))
         self.postprocess_dir = tappas_post_process_dir
-        self.video_source = self.options_menu.input
+        self.video_source="/dev/video0"
         self.source_type = get_source_type(self.video_source)
         self.user_data = user_data
-        self.video_sink = "autovideosink"
+        self.video_sink = "fakesink"
         self.pipeline = None
         self.loop = None
         self.threads = []
@@ -95,40 +93,26 @@ class GStreamerApp:
 
         # Set Hailo parameters; these parameters should be set based on the model used
         self.batch_size = 1
-        self.video_width = 1280
-        self.video_height = 720
+        self.video_width = 1920
+        self.video_height = 1080
         self.video_format = "RGB"
         self.hef_path = None
         self.app_callback = None
+        self.original_frame=None
 
-        # Set user data parameters
-        user_data.use_frame = self.options_menu.use_frame
+        self.sync ="true"
 
-        self.sync = "false" if (self.options_menu.disable_sync or self.source_type != "file") else "true"
-        self.show_fps = self.options_menu.show_fps
-
-        if self.options_menu.dump_dot:
-            os.environ["GST_DEBUG_DUMP_DOT_DIR"] = os.getcwd()
-
-    def on_fps_measurement(self, sink, fps, droprate, avgfps):
-        print(f"FPS: {fps:.2f}, Droprate: {droprate:.2f}, Avg FPS: {avgfps:.2f}")
-        return True
-
-    def create_pipeline(self):
+    def create_pipeline(self,disable_inference):
         # Initialize GStreamer
         Gst.init(None)
 
-        pipeline_string = self.get_pipeline_string()
+        pipeline_string = self.get_pipeline_string(disable_inference)
         try:
             self.pipeline = Gst.parse_launch(pipeline_string)
         except Exception as e:
             print(f"Error creating pipeline: {e}", file=sys.stderr)
+            print(pipeline_string)
             sys.exit(1)
-
-        # Connect to hailo_display fps-measurements
-        if self.show_fps:
-            print("Showing FPS")
-            self.pipeline.get_by_name("hailo_display").connect("fps-measurements", self.on_fps_measurement)
 
         # Create a GLib Main Loop
         self.loop = GLib.MainLoop()
@@ -164,28 +148,43 @@ class GStreamerApp:
 
 
     def shutdown(self, signum=None, frame=None):
-        print("Shutting down... Hit Ctrl-C again to force quit.")
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         self.pipeline.set_state(Gst.State.PAUSED)
         GLib.usleep(100000)  # 0.1 second delay
-
+        
         self.pipeline.set_state(Gst.State.READY)
         GLib.usleep(100000)  # 0.1 second delay
-
-        self.pipeline.set_state(Gst.State.NULL)
-        GLib.idle_add(self.loop.quit)
-
+        
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline=None
+	     
+        if self.loop and self.loop.is_running():
+            GLib.idle_add(self.loop.quit)
+            self.loop=None
+        
 
     def get_pipeline_string(self):
         # This is a placeholder function that should be overridden by the child class
         return ""
+        
+    def original_frame_callback(self,pad,info):
+        # Get the GstBuffer from the probe info
+        buffer = info.get_buffer()
+        # Check if the buffer is valid
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+        # Get the caps from the pad
+        format, width, height = hailo_rpi_common.get_caps_from_pad(pad)
+        frame=None
+        if format is not None and width is not None and height is not None:
+            # Get original frame
+            self.original_frame = hailo_rpi_common.get_numpy_from_buffer(buffer, format, width, height)
+        return Gst.PadProbeReturn.OK
+    
 
-    def dump_dot_file(self):
-        print("Dumping dot file...")
-        Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, "pipeline")
-        return False
-
-    def run(self):
+    def run(self,disable_inference=False):
+        self.create_pipeline(disable_inference)
         # Add a watch for messages on the pipeline's bus
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
@@ -193,13 +192,21 @@ class GStreamerApp:
 
 
         # Connect pad probe to the identity element
-        if not self.options_menu.disable_callback:
+        if not disable_inference:
             identity = self.pipeline.get_by_name("identity_callback")
             if identity is None:
                 print("Warning: identity_callback element not found, add <identity name=identity_callback> in your pipeline where you want the callback to be called.")
             else:
                 identity_pad = identity.get_static_pad("src")
                 identity_pad.add_probe(Gst.PadProbeType.BUFFER, self.app_callback, self.user_data)
+        
+        # Connect pad probe to original frame identity element
+        original=self.pipeline.get_by_name("original")
+        if original is None:
+            print("Warning: original element not found, add <identity name=original> in your pipeline where you want the callback to be called.")
+        else:
+            pad=original.get_static_pad("src")
+            pad.add_probe(Gst.PadProbeType.BUFFER,self.original_frame_callback)
 
         hailo_display = self.pipeline.get_by_name("hailo_display")
         if hailo_display is None:
@@ -207,11 +214,6 @@ class GStreamerApp:
 
         # Disable QoS to prevent frame drops
         disable_qos(self.pipeline)
-
-        # Start a subprocess to run the display_user_data_frame function
-        if self.options_menu.use_frame:
-            display_process = multiprocessing.Process(target=display_user_data_frame, args=(self.user_data,))
-            display_process.start()
 
         if self.source_type == "rpi":
             picam_thread = threading.Thread(target=picamera_thread, args=(self.pipeline, self.video_width, self.video_height, self.video_format))
@@ -228,9 +230,6 @@ class GStreamerApp:
         # Set pipeline to PLAYING state
         self.pipeline.set_state(Gst.State.PLAYING)
 
-        # Dump dot file
-        if self.options_menu.dump_dot:
-            GLib.timeout_add_seconds(3, self.dump_dot_file)
 
         # Run the GLib event loop
         self.loop.run()
@@ -238,21 +237,12 @@ class GStreamerApp:
         # Clean up
         try:
             self.user_data.running = False
-            self.pipeline.set_state(Gst.State.NULL)
-            if self.options_menu.use_frame:
-                display_process.terminate()
-                display_process.join()
             for t in self.threads:
                 t.join()
+            print('Cleanup complete.')
         except Exception as e:
-            print(f"Error during cleanup: {e}", file=sys.stderr)
-        finally:
-            if self.error_occurred:
-                print("Exiting with error...", file=sys.stderr)
-                sys.exit(1)
-            else:
-                print("Exiting...")
-                sys.exit(0)
+            print(f"Error during cleanup: {e}.", file=sys.stderr)
+        
 
 def picamera_thread(pipeline, video_width, video_height, video_format, picamera_config=None):
     appsrc = pipeline.get_by_name("app_source")
@@ -330,16 +320,8 @@ def disable_qos(pipeline):
             break
 
         # Check if the element has the 'qos' property
-        if 'qos' in GObject.list_properties(element):
+        if 'qos' in [prop.name for prop in GObject.list_properties(element)]:
             # Set the 'qos' property to False
             element.set_property('qos', False)
             print(f"Set qos to False for {element.get_name()}")
 
-# This function is used to display the user data frame
-def display_user_data_frame(user_data: app_callback_class):
-    while user_data.running:
-        frame = user_data.get_frame()
-        if frame is not None:
-            cv2.imshow("User Frame", frame)
-        cv2.waitKey(1)
-    cv2.destroyAllWindows()

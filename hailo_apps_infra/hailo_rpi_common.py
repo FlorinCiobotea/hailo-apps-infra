@@ -64,41 +64,6 @@ def get_caps_from_pad(pad: Gst.Pad):
         return None, None, None
 
 
-def get_default_parser():
-    parser = argparse.ArgumentParser(description="Hailo App Help")
-    current_path = os.path.dirname(os.path.abspath(__file__))
-    default_video_source = os.path.join(current_path, '../resources/example.mp4')
-    parser.add_argument(
-        "--input", "-i", type=str, default=default_video_source,
-        help="Input source. Can be a file, USB (webcam), RPi camera (CSI camera module) or ximage. \
-        For RPi camera use '-i rpi' \
-        Defaults to example video resources/example.mp4"
-    )
-    parser.add_argument("--use-frame", "-u", action="store_true", help="Use frame from the callback function")
-    parser.add_argument("--show-fps", "-f", action="store_true", help="Print FPS on sink")
-    parser.add_argument(
-            "--arch",
-            default=None,
-            choices=['hailo8', 'hailo8l'],
-            help="Specify the Hailo architecture (hailo8 or hailo8l). Default is None , app will run check.",
-        )
-    parser.add_argument(
-            "--hef-path",
-            default=None,
-            help="Path to HEF file",
-        )
-    parser.add_argument(
-        "--disable-sync", action="store_true",
-        help="Disables display sink sync, will run as fast as possible. Relevant when using file source."
-    )
-    parser.add_argument(
-        "--disable-callback", action="store_true",
-        help="Disables the user's custom callback function in the pipeline. Use this option to run the pipeline without invoking the callback logic."
-    )
-    parser.add_argument("--dump-dot", action="store_true", help="Dump the pipeline graph to a dot file pipeline.dot")
-    return parser
-
-
 # ---------------------------------------------------------
 # Functions used to get numpy arrays from GStreamer buffers
 # ---------------------------------------------------------

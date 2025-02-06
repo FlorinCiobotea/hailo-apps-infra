@@ -14,7 +14,7 @@ def get_source_type(input_source):
     else:
         return 'file'
 
-def QUEUE(name, max_size_buffers=3, max_size_bytes=0, max_size_time=0, leaky='no'):
+def QUEUE(name, max_size_buffers=1, max_size_bytes=0, max_size_time=0, leaky='no'):
     """
     Creates a GStreamer queue element string with the specified parameters.
 
@@ -73,10 +73,10 @@ def SOURCE_PIPELINE(video_source, video_width=640, video_height=640, video_forma
             # Use compressed format for webcam
             width, height = get_camera_resulotion(video_width, video_height)
             source_element = (
-                f'v4l2src device={video_source} name={name} ! image/jpeg, framerate=30/1, width={width}, height={height} ! '
-                f'{QUEUE(name=f"{name}_queue_decode")} ! '
-                f'decodebin name={name}_decodebin ! '
-                f'videoflip name=videoflip video-direction=horiz ! '
+                f'v4l2src device={video_source} name={name} extra-controls="c,auto_exposure=2,exposure_time_absolute=330,exposure_dynamic_framerate=0" num-buffers=1 ! image/jpeg, framerate=30/1, width={width}, height={height} ! jpegdec ! '
+                #f'{QUEUE(name=f"{name}_queue_decode")} ! '
+                #f'decodebin name={name}_decodebin ! '
+                #f'videoflip name=videoflip video-direction=horiz ! '
             )
     elif source_type == 'rpi':
         source_element = (
@@ -107,10 +107,29 @@ def SOURCE_PIPELINE(video_source, video_width=640, video_height=640, video_forma
         f'videoscale name={name}_videoscale n-threads=2 ! '
         f'{QUEUE(name=f"{name}_convert_q")} ! '
         f'videoconvert n-threads=3 name={name}_convert qos=false ! '
-        f'video/x-raw, pixel-aspect-ratio=1/1, format={video_format}, width={video_width}, height={video_height} '
+        f'video/x-raw, pixel-aspect-ratio=1/1, format={video_format}, width={video_width}, height={video_height} ! identity name=original ! '
     )
 
     return source_pipeline
+
+def TILE_CROPPER_PIPELINE(internal_offset=False,tiling_mode=1,scale_level=3,tiles_along_x_axis=3,tiles_along_y_axis=3,overlap_x_axis=0.1,overlap_y_axis=0.08,name="cropper"):
+    tile_cropper_pipeline=(
+     f'{QUEUE(name=f"{name}_q")} ! '
+     f'hailotilecropper internal-offset={internal_offset} name={name} tiling-mode={tiling_mode} scale-level={scale_level} '
+     f'tiles-along-x-axis={tiles_along_x_axis} tiles-along-y-axis={tiles_along_y_axis} overlap-x-axis={overlap_x_axis} overlap-y-axis={overlap_y_axis}'
+     )
+     
+    return tile_cropper_pipeline
+     
+def TILE_AGGREGATOR_PIPELINE(iou_threshold=0.3,border_threshold=0.1,name="agg",cropper_name="cropper"):
+    tile_aggregator_pipeline=(
+    f'hailotileaggregator flatten-detections=true iou-threshold={iou_threshold} border-threshold={border_threshold} name={name} {cropper_name}. '
+    f'! {QUEUE(name=f"{name}_q")} '
+    f'! {name}. {cropper_name}.'
+    )
+    
+    return tile_aggregator_pipeline
+
 
 def INFERENCE_PIPELINE(
     hef_path,
@@ -167,6 +186,8 @@ def INFERENCE_PIPELINE(
         f'{scheduler_timeout_ms_str}'
         f'{scheduler_priority_str}'
         f'{additional_params} '
+        f'is-active=true '
+        f'pass-through=false '
         f'force-writable=true '
     )
 
@@ -183,10 +204,10 @@ def INFERENCE_PIPELINE(
     if post_process_so:
         inference_pipeline += (
             f'{QUEUE(name=f"{name}_hailofilter_q")} ! '
-            f'hailofilter name={name}_hailofilter so-path={post_process_so} {config_str} {function_name_str} qos=false ! '
+            f'hailofilter name={name}_hailofilter so-path={post_process_so} {config_str} {function_name_str} qos=false '
         )
 
-    inference_pipeline += f'{QUEUE(name=f"{name}_output_q")} '
+    inference_pipeline += f'! {QUEUE(name=f"{name}_output_q")} '
 
     return inference_pipeline
 
